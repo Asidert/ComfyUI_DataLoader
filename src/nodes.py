@@ -41,7 +41,7 @@ import json
 
 from .download import download_to_path, refresh_folder_cache, comfy_base_path
 
-CATEGORY = "FlammaData"
+CATEGORY = "data"
 
 
 def _is_string_list(value):
@@ -119,7 +119,9 @@ class DataLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "commands": ("STRING", {"default": "[]", "multiline": True}),
+                # Managed by the node's web UI (Add File rows). Hidden in the
+                # editor; holds the serialized JSON list of downloads.
+                "commands": ("STRING", {"default": "[]"}),
             },
             "optional": {
                 "overwrite": ("BOOLEAN", {"default": False}),
