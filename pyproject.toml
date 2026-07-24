@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=70.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui_dataloader"
+version = "1.0.0"
+description = "Nodes that download files (e.g. LoRAs) from the internet into the ComfyUI container at execution time"
+authors = [{name = "Boris Zyrianov", email = "612boris40@gmail.com"}]
+readme = "README.md"
+license = {text = "MIT license"}
+requires-python = ">=3.10"
+classifiers = []
+dependencies = ["requests"]
+
+[project.urls]
+Repository = "https://github.com/Asidert/ComfyUI_DataLoader"
+BugTracker = "https://github.com/Asidert/ComfyUI_DataLoader/issues"
+
+[tool.comfy]
+PublisherId = "Asidert"
+DisplayName = "ComfyUI_DataLoader"
+Icon = ""
+Tags = []
+Repository = "https://github.com/Asidert/ComfyUI_DataLoader"
+
+includes = []
