@@ -6,7 +6,10 @@ parsing live in ``nodes.py``.
 """
 
 import os
+import json
+import time
 import hashlib
+from urllib.parse import urljoin
 
 import folder_paths
 
@@ -21,6 +24,42 @@ except Exception:  # pragma: no cover - fallback path
 
 CHUNK = 1 << 20  # 1 MiB
 USER_AGENT = "ComfyUI_DataLoader/1.0"
+
+
+def fetch_json(url, headers=None, timeout=60):
+    """GET ``url`` and parse the JSON body (used for the sync manifest)."""
+    req_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if headers:
+        req_headers.update({str(k): str(v) for k, v in headers.items()})
+    if _HAS_REQUESTS:
+        r = requests.get(url, headers=req_headers, timeout=timeout, allow_redirects=True)
+        r.raise_for_status()
+        return r.json()
+    req = urllib.request.Request(url, headers=req_headers)  # pragma: no cover
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def resolve_url(base_url, maybe_relative):
+    """Turn a possibly-relative manifest ``url`` into an absolute one."""
+    return urljoin(base_url, maybe_relative or "")
+
+
+def local_mtime(path):
+    """Integer mtime (seconds) of a local file, or ``None`` if it doesn't exist."""
+    try:
+        return int(os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+def stamp_mtime(path, mtime):
+    """Set a file's mtime so future syncs compare against the source timestamp."""
+    try:
+        if mtime:
+            os.utime(path, (int(mtime), int(mtime)))
+    except OSError:
+        pass
 
 
 def comfy_base_path() -> str:
@@ -59,14 +98,42 @@ def _verify_sha256(path: str, expected: str) -> None:
         )
 
 
-def _report(name, done, total, progress_cb):
+class _Speed:
+    """Tracks download speed (bytes/sec, EMA-smoothed) and ETA."""
+
+    def __init__(self):
+        now = time.time()
+        self.t0 = now
+        self.last_t = now
+        self.last_b = 0
+        self.ema = 0.0
+
+    def sample(self, done, total):
+        now = time.time()
+        dt = now - self.last_t
+        if dt >= 0.25:
+            inst = (done - self.last_b) / dt
+            self.ema = inst if self.ema == 0 else (0.6 * self.ema + 0.4 * inst)
+            self.last_t = now
+            self.last_b = done
+        speed = self.ema
+        if speed <= 0:  # early on, fall back to the running average
+            elapsed = now - self.t0
+            speed = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - done) / speed if (total and speed > 0) else None
+        return speed, eta
+
+
+def _report(name, done, total, progress_cb, speed=0.0, eta=None):
     if progress_cb:
-        progress_cb(done, total)
+        progress_cb(done, total, speed, eta)
+    mbps = speed / 1048576.0
     if total:
+        eta_s = f" ETA {int(eta)}s" if eta is not None else ""
         print(f"[DataLoader] {name}: {done * 100 // total}% "
-              f"({done >> 20}/{total >> 20} MiB)", flush=True)
+              f"({done >> 20}/{total >> 20} MiB, {mbps:.1f} MB/s{eta_s})", flush=True)
     else:
-        print(f"[DataLoader] {name}: {done >> 20} MiB", flush=True)
+        print(f"[DataLoader] {name}: {done >> 20} MiB ({mbps:.1f} MB/s)", flush=True)
 
 
 def _stream_requests(url, headers, tmp, timeout, progress_cb=None):
@@ -84,8 +151,9 @@ def _stream_requests(url, headers, tmp, timeout, progress_cb=None):
         done = 0
         next_mark = 0
         step = max(total // 100, CHUNK) if total else 4 * CHUNK
+        meter = _Speed()
         if progress_cb:
-            progress_cb(0, total)
+            progress_cb(0, total, 0.0, None)
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(CHUNK):
                 if not chunk:
@@ -93,9 +161,11 @@ def _stream_requests(url, headers, tmp, timeout, progress_cb=None):
                 f.write(chunk)
                 done += len(chunk)
                 if done >= next_mark:
-                    _report(name, done, total, progress_cb)
+                    speed, eta = meter.sample(done, total)
+                    _report(name, done, total, progress_cb, speed, eta)
                     next_mark = done + step
-        _report(name, done, total, progress_cb)
+        speed, eta = meter.sample(done, total)
+        _report(name, done, total, progress_cb, speed, 0)
 
 
 def _stream_urllib(url, headers, tmp, timeout, progress_cb=None):  # pragma: no cover
@@ -106,8 +176,9 @@ def _stream_urllib(url, headers, tmp, timeout, progress_cb=None):  # pragma: no 
         done = 0
         next_mark = 0
         step = max(total // 100, CHUNK) if total else 4 * CHUNK
+        meter = _Speed()
         if progress_cb:
-            progress_cb(0, total)
+            progress_cb(0, total, 0.0, None)
         with open(tmp, "wb") as f:
             while True:
                 chunk = r.read(CHUNK)
@@ -116,9 +187,11 @@ def _stream_urllib(url, headers, tmp, timeout, progress_cb=None):  # pragma: no 
                 f.write(chunk)
                 done += len(chunk)
                 if done >= next_mark:
-                    _report(name, done, total, progress_cb)
+                    speed, eta = meter.sample(done, total)
+                    _report(name, done, total, progress_cb, speed, eta)
                     next_mark = done + step
-        _report(name, done, total, progress_cb)
+        speed, eta = meter.sample(done, total)
+        _report(name, done, total, progress_cb, speed, 0)
 
 
 def download_to_path(

@@ -255,11 +255,41 @@ function ensureProgressPanel(node) {
     observe(node, content);
 }
 
-function buildBars(node, files) {
+function buildBars(node, files, overall) {
     ensureProgressPanel(node);
     const content = node._dlProgContent;
     content.innerHTML = "";
     node._dlBars = {};
+    node._dlOverall = null;
+
+    if (overall && overall.files_total > 0) {
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "display:flex;flex-direction:column;gap:3px;" +
+            "padding-bottom:6px;margin-bottom:2px;border-bottom:1px solid #3a3a3a;";
+        const top = document.createElement("div");
+        top.style.cssText =
+            "display:flex;justify-content:space-between;gap:8px;" +
+            "font:11px ui-monospace,Menlo,Consolas,monospace;color:#dfe;";
+        const name = document.createElement("span");
+        name.textContent = "Overall";
+        name.style.cssText = "font-weight:700;color:#cfe8de;";
+        const pct = document.createElement("span");
+        pct.textContent = `0/${overall.files_total} files`;
+        pct.style.cssText = "flex:none;color:#9fbfb2;text-align:right;";
+        top.append(name, pct);
+        const track = document.createElement("div");
+        track.className = "dl-track";
+        track.style.height = "11px";
+        const fill = document.createElement("div");
+        fill.className = "dl-fill";
+        track.appendChild(fill);
+        const probe = document.createElement("div");
+        probe.style.cssText = "font:10px sans-serif;color:#c8a86a;display:none;";
+        wrap.append(top, track, probe);
+        content.appendChild(wrap);
+        node._dlOverall = { fill, pct, probe };
+    }
+
     for (const f of files || []) {
         const wrap = document.createElement("div");
         wrap.style.cssText = "display:flex;flex-direction:column;gap:3px;";
@@ -270,7 +300,8 @@ function buildBars(node, files) {
             "font:11px ui-monospace,Menlo,Consolas,monospace;color:#ccc;";
         const name = document.createElement("span");
         name.textContent = f.name || `file ${f.index}`;
-        name.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        name.style.cssText =
+            "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
         const pct = document.createElement("span");
         pct.textContent = "0%";
         pct.style.cssText = "flex:none;color:#9fbfb2;";
@@ -292,18 +323,65 @@ function buildBars(node, files) {
     resize(node);
 }
 
-function onProgress(node, index, done, total) {
+function fmtSpeed(bps) {
+    if (!bps || bps <= 0) return "";
+    if (bps >= 1048576) return (bps / 1048576).toFixed(1) + " MB/s";
+    if (bps >= 1024) return (bps / 1024).toFixed(0) + " KB/s";
+    return Math.round(bps) + " B/s";
+}
+
+function fmtEta(s) {
+    if (s == null || !isFinite(s) || s < 0) return "";
+    s = Math.round(s);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+
+function onProgress(node, index, done, total, speed, eta) {
     const bar = node._dlBars && node._dlBars[index];
     if (!bar) return;
+    const sp = fmtSpeed(speed);
     if (total > 0) {
         bar.fill.classList.remove("ind");
         const p = Math.min(100, Math.floor((done / total) * 100));
         bar.fill.style.width = p + "%";
-        bar.pct.textContent = p + "%";
+        const et = fmtEta(eta);
+        bar.pct.textContent = [p + "%", sp, et && "ETA " + et].filter(Boolean).join(" · ");
     } else {
         bar.fill.classList.add("ind");
-        bar.pct.textContent = (done / 1048576).toFixed(0) + " MiB";
+        bar.pct.textContent = [(done / 1048576).toFixed(0) + " MiB", sp]
+            .filter(Boolean).join(" · ");
     }
+}
+
+function onOverall(node, d) {
+    const bar = node._dlOverall;
+    if (!bar) return;
+    const sp = fmtSpeed(d.speed);
+    let p, parts;
+    if (d.total > 0) {
+        p = Math.min(100, Math.floor((d.done / d.total) * 100));
+        const et = fmtEta(d.eta);
+        parts = [`${d.files_done}/${d.files_total} files`, p + "%", sp, et && "ETA " + et];
+    } else {
+        p = d.files_total ? Math.floor((d.files_done / d.files_total) * 100) : 0;
+        parts = [`${d.files_done}/${d.files_total} files`, sp];
+    }
+    bar.fill.style.width = p + "%";
+    bar.pct.textContent = parts.filter(Boolean).join(" · ");
+}
+
+function onSpeedcheck(node, d) {
+    const bar = node._dlOverall;
+    if (!bar || !bar.probe) return;
+    const parts = [`speed check: ${fmtSpeed(d.speed)} over ${d.window_seconds}s`];
+    if (d.eta_total != null) parts.push(`est. total ${fmtEta(d.eta_total)}`);
+    bar.probe.textContent = parts.join(" · ");
+    bar.probe.style.display = "";
+    resize(node);
 }
 
 function onFile(node, index, status, error) {
@@ -348,6 +426,86 @@ function applySummary(node, text) {
 }
 
 // ---------------------------------------------------------------------------
+// text note panel (ModelSync summary)
+// ---------------------------------------------------------------------------
+function showNote(node, text) {
+    if (!node._dlNoteEl) {
+        const outer = document.createElement("div");
+        outer.style.cssText = "width:100%;box-sizing:border-box;";
+        const el = document.createElement("div");
+        el.style.cssText =
+            "background:#181818;color:#dcdcdc;font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;" +
+            "padding:6px 8px;border-radius:4px;white-space:pre-wrap;box-sizing:border-box;";
+        outer.appendChild(el);
+        node._dlNoteEl = el;
+        const w = node.addDOMWidget("dl_note", "div", outer, { serialize: false });
+        w.computeSize = (width) => [width, (el.offsetHeight || 18) + 6];
+        observe(node, el);
+    }
+    node._dlNoteEl.textContent = text;
+    resize(node);
+}
+
+function showSyncSummary(node, text) {
+    let s = null;
+    try {
+        s = JSON.parse(text);
+    } catch (e) {
+        return;
+    }
+    if (!s || !s.counts) return;
+    const c = s.counts;
+    let msg = `updated ${c.updated} · up-to-date ${c.up_to_date} · ` +
+              `errors ${c.errors}  (total ${c.total})`;
+    if (s.errors && s.errors.length) {
+        msg += "\n" + s.errors.map((e) => `✗ ${e.target}: ${e.error}`).join("\n");
+    }
+    showNote(node, msg);
+}
+
+// ---------------------------------------------------------------------------
+// mode switching (manual <-> manifest): toggle which widgets are visible
+// ---------------------------------------------------------------------------
+const MANUAL_ONLY = ["overwrite"];
+const MANIFEST_ONLY = ["manifest_url", "token", "force"];
+
+function findW(node, name) {
+    return node.widgets && node.widgets.find((w) => w.name === name);
+}
+
+function setWidgetVisible(node, w, visible) {
+    if (!w) return;
+    if (w._dlOrigType === undefined) {
+        w._dlOrigType = w.type;
+        w._dlOrigCompute = w.computeSize;
+    }
+    if (visible) {
+        w.type = w._dlOrigType;
+        w.computeSize = w._dlOrigCompute;
+        if (w.element) w.element.style.display = "";
+        if (w.inputEl) w.inputEl.style.display = "";
+    } else {
+        w.type = "hidden";
+        w.computeSize = () => [0, -4];
+        if (w.element) w.element.style.display = "none";
+        if (w.inputEl) w.inputEl.style.display = "none";
+    }
+}
+
+function getMode(node) {
+    const w = findW(node, "mode");
+    return w && w.value === "manifest" ? "manifest" : "manual";
+}
+
+function applyMode(node) {
+    const manifest = getMode(node) === "manifest";
+    for (const name of MANUAL_ONLY) setWidgetVisible(node, findW(node, name), !manifest);
+    for (const name of MANIFEST_ONLY) setWidgetVisible(node, findW(node, name), manifest);
+    if (node._dlEditorWidget) setWidgetVisible(node, node._dlEditorWidget, !manifest);
+    resize(node);
+}
+
+// ---------------------------------------------------------------------------
 // registration
 // ---------------------------------------------------------------------------
 app.registerExtension({
@@ -356,11 +514,20 @@ app.registerExtension({
     async setup() {
         api.addEventListener("dataloader.start", (e) => {
             const n = getNode(e.detail.node);
-            if (n) buildBars(n, e.detail.files);
+            if (n) buildBars(n, e.detail.files, e.detail.overall);
+        });
+        api.addEventListener("dataloader.overall", (e) => {
+            const n = getNode(e.detail.node);
+            if (n) onOverall(n, e.detail);
+        });
+        api.addEventListener("dataloader.speedcheck", (e) => {
+            const n = getNode(e.detail.node);
+            if (n) onSpeedcheck(n, e.detail);
         });
         api.addEventListener("dataloader.progress", (e) => {
             const n = getNode(e.detail.node);
-            if (n) onProgress(n, e.detail.index, e.detail.done, e.detail.total);
+            if (n) onProgress(n, e.detail.index, e.detail.done, e.detail.total,
+                              e.detail.speed, e.detail.eta);
         });
         api.addEventListener("dataloader.file", (e) => {
             const n = getNode(e.detail.node);
@@ -379,15 +546,28 @@ app.registerExtension({
             const node = this;
             node.color = ACCENT;
 
-            node._dlCommands = node.widgets?.find((w) => w.name === "commands");
+            node._dlCommands = findW(node, "commands");
             hideWidget(node._dlCommands);
 
             const outer = buildEditor(node);
             const ew = node.addDOMWidget("dl_editor", "div", outer, { serialize: false });
-            ew.computeSize = (width) => [width, (node._dlEditorContent.offsetHeight || 60) + 6];
+            ew.computeSize = (width) =>
+                [width, (node._dlEditorContent.offsetHeight || 60) + 6];
+            node._dlEditorWidget = ew;
             observe(node, node._dlEditorContent);
 
+            const modeW = findW(node, "mode");
+            if (modeW) {
+                const orig = modeW.callback;
+                modeW.callback = function () {
+                    const rr = orig ? orig.apply(this, arguments) : undefined;
+                    applyMode(node);
+                    return rr;
+                };
+            }
+
             rebuildRows(node);
+            applyMode(node);
             return r;
         };
 
@@ -395,6 +575,7 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function () {
             const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
             rebuildRows(this);
+            applyMode(this);
             return r;
         };
 
@@ -402,7 +583,10 @@ app.registerExtension({
         nodeType.prototype.onExecuted = function (message) {
             const r = onExecuted ? onExecuted.apply(this, arguments) : undefined;
             const text = message && message.text && message.text[0];
-            if (text) applySummary(this, text);
+            if (text) {
+                if (getMode(this) === "manifest") showSyncSummary(this, text);
+                else applySummary(this, text);
+            }
             resize(this);
             return r;
         };

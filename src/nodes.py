@@ -38,8 +38,18 @@ An object form is also accepted per item for readability::
 
 import os
 import json
+import time
 
-from .download import download_to_path, refresh_folder_cache, comfy_base_path
+from .download import (
+    download_to_path,
+    refresh_folder_cache,
+    comfy_base_path,
+    fetch_json,
+    resolve_url,
+    local_mtime,
+    stamp_mtime,
+    _Speed,
+)
 
 try:  # optional - only present inside a running ComfyUI
     from server import PromptServer
@@ -128,18 +138,32 @@ def _resolve_dest(destination: str) -> str:
 
 
 class DataLoader:
-    """Download one or many files into the container from a command list."""
+    """Download files into the container, either from a manual list of commands
+    or by syncing against a manifest endpoint (updating only changed files)."""
+
+    MODES = ["manual", "manifest"]
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # Managed by the node's web UI (Add File rows). Hidden in the
-                # editor; holds the serialized JSON list of downloads.
-                "commands": ("STRING", {"default": "[]"}),
+                "mode": (cls.MODES, {"default": "manual"}),
             },
             "optional": {
+                # manual mode - managed by the node's web UI (Add File rows).
+                "commands": ("STRING", {"default": "[]"}),
                 "overwrite": ("BOOLEAN", {"default": False}),
+                # manifest mode.
+                "manifest_url": ("STRING", {
+                    "default": "https://dev.flammaverse.com/worker_models/image",
+                }),
+                "token": ("STRING", {"default": ""}),
+                "force": ("BOOLEAN", {"default": False}),
+                # manifest mode: emit a `dataloader.speedcheck` WS event after
+                # this many seconds so the caller can decide to wait or bail on a
+                # slow worker (0 = off).
+                "speed_probe_seconds": ("INT", {"default": 10, "min": 0, "max": 600}),
+                # shared.
                 "stop_on_error": ("BOOLEAN", {"default": True}),
                 "timeout": ("INT", {"default": 120, "min": 1, "max": 3600}),
             },
@@ -152,10 +176,20 @@ class DataLoader:
     OUTPUT_NODE = True
     CATEGORY = CATEGORY
 
-    def run(self, commands, overwrite=False, stop_on_error=True,
-            timeout=120, unique_id=None):
-        items = _normalize(commands)
+    def run(self, mode="manual", commands="[]", overwrite=False,
+            manifest_url="", token="", force=False, speed_probe_seconds=10,
+            stop_on_error=True, timeout=120, unique_id=None):
         node_id = str(unique_id) if unique_id is not None else ""
+        if mode == "manifest":
+            return self._run_manifest(
+                node_id, manifest_url, token, force, stop_on_error, timeout,
+                speed_probe_seconds)
+        return self._run_manual(
+            node_id, commands, overwrite, stop_on_error, timeout)
+
+    # ------------------------------------------------------------------ manual
+    def _run_manual(self, node_id, commands, overwrite, stop_on_error, timeout):
+        items = _normalize(commands)
         resolved = [(_resolve_dest(it["destination"]), it) for it in items]
 
         _send("dataloader.start", {
@@ -170,9 +204,11 @@ class DataLoader:
         for idx, (dest, item) in enumerate(resolved):
             entry = {"destination": dest, "source": item["source"]}
 
-            def progress_cb(done, total, _i=idx):
-                _send("dataloader.progress",
-                      {"node": node_id, "index": _i, "done": done, "total": total})
+            def progress_cb(done, total, speed=0.0, eta=None, _i=idx):
+                _send("dataloader.progress", {
+                    "node": node_id, "index": _i, "done": done, "total": total,
+                    "speed": speed, "eta": eta,
+                })
 
             try:
                 _, downloaded = download_to_path(
@@ -217,11 +253,157 @@ class DataLoader:
         print(f"[DataLoader] Summary: {summary}", flush=True)
         return {"ui": {"text": [summary]}, "result": (summary,)}
 
+    # ---------------------------------------------------------------- manifest
+    def _run_manifest(self, node_id, manifest_url, token, force, stop_on_error,
+                      timeout, speed_probe_seconds=0):
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+
+        data = fetch_json(manifest_url, headers=headers, timeout=timeout)
+        files = data.get("files") if isinstance(data, dict) else data
+        if not isinstance(files, list):
+            raise ValueError("Manifest has no 'files' list")
+
+        base = comfy_base_path()
+        entries = []
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            target = f.get("target") or f.get("path")
+            src = f.get("url") or f.get("source")
+            if not target or not src:
+                continue
+            rel = str(target).replace("\\", "/").lstrip("/")
+            dest = os.path.normpath(os.path.join(base, *rel.split("/")))
+            entries.append({
+                "target": rel,
+                "name": os.path.basename(rel),
+                # The manifest url is only a path; join it onto the manifest
+                # endpoint's scheme+host so the domain is derived automatically.
+                "url": resolve_url(manifest_url, src),
+                "updated_at": int(f.get("updated_at") or 0),
+                "size": int(f.get("size_bytes") or f.get("size") or 0),
+                "dest": dest,
+            })
+
+        # Only files that are missing or older than the manifest are (re)fetched.
+        to_update, up_to_date = [], []
+        for e in entries:
+            lm = local_mtime(e["dest"])
+            if force or lm is None or (e["updated_at"] and lm < e["updated_at"]):
+                to_update.append(e)
+            else:
+                up_to_date.append(e)
+
+        files_total = len(to_update)
+        total_bytes = sum(e["size"] for e in to_update)
+
+        _send("dataloader.start", {
+            "node": node_id,
+            "files": [{"index": i, "name": e["name"], "size": e["size"]}
+                      for i, e in enumerate(to_update)],
+            "overall": {"total_bytes": total_bytes, "files_total": files_total},
+        })
+
+        overall = _Speed()
+        done_base = 0  # bytes of files already finished
+        probe = {"t0": None, "sent": False}
+
+        def _maybe_probe(overall_done):
+            # After `speed_probe_seconds` from the first byte, emit an early
+            # average-speed reading + projected total time so the caller can
+            # decide whether the worker is worth waiting for.
+            if not speed_probe_seconds or probe["sent"]:
+                return
+            now = time.time()
+            if probe["t0"] is None:
+                probe["t0"] = now
+                return
+            elapsed = now - probe["t0"]
+            if elapsed < speed_probe_seconds:
+                return
+            speed = overall_done / elapsed if elapsed > 0 else 0.0
+            remaining = max(total_bytes - overall_done, 0)
+            eta_total = (remaining / speed) if speed > 0 else None
+            probe["sent"] = True
+            _send("dataloader.speedcheck", {
+                "node": node_id,
+                "window_seconds": round(elapsed, 1),
+                "bytes": overall_done,
+                "speed": speed,             # bytes/sec, averaged over the window
+                "total_bytes": total_bytes,
+                "files_total": files_total,
+                "eta_total": eta_total,     # seconds to finish the whole update
+            })
+            print(f"[DataLoader] speedcheck: {speed / 1048576:.1f} MB/s over "
+                  f"{elapsed:.0f}s, est. total "
+                  f"{'?' if eta_total is None else int(eta_total)}s", flush=True)
+
+        def _emit_overall(overall_done, files_done):
+            osp, oeta = overall.sample(overall_done, total_bytes)
+            _send("dataloader.overall", {
+                "node": node_id, "done": overall_done, "total": total_bytes,
+                "files_done": files_done, "files_total": files_total,
+                "speed": osp, "eta": oeta,
+            })
+            _maybe_probe(overall_done)
+
+        updated, errors = [], []
+        for idx, e in enumerate(to_update):
+            last = {"done": 0}
+
+            def progress_cb(done, total, speed=0.0, eta=None, _i=idx, _last=last):
+                _last["done"] = done
+                _send("dataloader.progress", {
+                    "node": node_id, "index": _i, "done": done, "total": total,
+                    "speed": speed, "eta": eta,
+                })
+                _emit_overall(done_base + done, _i)
+
+            try:
+                download_to_path(
+                    e["url"], e["dest"],
+                    headers=headers, overwrite=True,
+                    timeout=timeout, progress_cb=progress_cb,
+                )
+                stamp_mtime(e["dest"], e["updated_at"])
+                done_base += e["size"] or last["done"]
+                _emit_overall(done_base, idx + 1)
+                updated.append({"target": e["target"], "updated_at": e["updated_at"]})
+                _send("dataloader.file",
+                      {"node": node_id, "index": idx, "status": "downloaded"})
+            except Exception as exc:
+                msg = f"{type(exc).__name__}: {exc}"
+                errors.append({"target": e["target"], "error": msg})
+                _send("dataloader.file",
+                      {"node": node_id, "index": idx, "status": "error", "error": msg})
+                print(f"[DataLoader] SYNC ERROR {e['url']} -> {e['dest']}: {msg}", flush=True)
+                if stop_on_error:
+                    _send("dataloader.done", {"node": node_id})
+                    raise RuntimeError(f"DataLoader sync failed on {e['target']}: {msg}") from exc
+
+        if updated:
+            refresh_folder_cache()
+        _send("dataloader.done", {"node": node_id})
+
+        summary = {
+            "mode": "manifest",
+            "updated": updated,
+            "up_to_date": [e["target"] for e in up_to_date],
+            "errors": errors,
+            "counts": {
+                "total": len(entries), "updated": len(updated),
+                "up_to_date": len(up_to_date), "errors": len(errors),
+            },
+        }
+        text = json.dumps(summary, ensure_ascii=False)
+        print(f"[DataLoader] Sync {summary['counts']}", flush=True)
+        return {"ui": {"text": [text]}, "result": (text,)}
+
 
 NODE_CLASS_MAPPINGS = {
     "DataLoader": DataLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DataLoader": "Data Loader (Download Files)",
+    "DataLoader": "Data Loader (Download / Sync)",
 }
