@@ -42,31 +42,21 @@ import json
 from .download import download_to_path, refresh_folder_cache, comfy_base_path
 
 try:  # optional - only present inside a running ComfyUI
-    import comfy.utils as _comfy_utils
+    from server import PromptServer
 except Exception:
-    _comfy_utils = None
+    PromptServer = None
 
 CATEGORY = "data"
 
 
-class _NodeProgress:
-    """Drives ComfyUI's native per-node progress bar from download bytes.
-
-    A fresh instance per file: the node's bar fills 0->100% for each download.
-    No-op when Content-Length is unknown or comfy.utils is unavailable.
-    """
-
-    def __init__(self):
-        self.pbar = None
-        self.total = 0
-
-    def __call__(self, done, total):
-        if _comfy_utils is None or total <= 0:
-            return
-        if self.pbar is None or self.total != total:
-            self.pbar = _comfy_utils.ProgressBar(total)
-            self.total = total
-        self.pbar.update_absolute(min(done, total), total)
+def _send(event, data):
+    """Push a UI event to the frontend over ComfyUI's WebSocket (best effort)."""
+    if PromptServer is None:
+        return
+    try:
+        PromptServer.instance.send_sync(event, data)
+    except Exception:
+        pass
 
 
 def _is_string_list(value):
@@ -153,6 +143,7 @@ class DataLoader:
                 "stop_on_error": ("BOOLEAN", {"default": True}),
                 "timeout": ("INT", {"default": 120, "min": 1, "max": 3600}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("STRING",)
@@ -161,14 +152,28 @@ class DataLoader:
     OUTPUT_NODE = True
     CATEGORY = CATEGORY
 
-    def run(self, commands, overwrite=False, stop_on_error=True, timeout=120):
+    def run(self, commands, overwrite=False, stop_on_error=True,
+            timeout=120, unique_id=None):
         items = _normalize(commands)
+        node_id = str(unique_id) if unique_id is not None else ""
+        resolved = [(_resolve_dest(it["destination"]), it) for it in items]
+
+        _send("dataloader.start", {
+            "node": node_id,
+            "files": [{"index": i, "name": os.path.basename(dest)}
+                      for i, (dest, _) in enumerate(resolved)],
+        })
+
         results = []
         any_downloaded = False
 
-        for item in items:
-            dest = _resolve_dest(item["destination"])
+        for idx, (dest, item) in enumerate(resolved):
             entry = {"destination": dest, "source": item["source"]}
+
+            def progress_cb(done, total, _i=idx):
+                _send("dataloader.progress",
+                      {"node": node_id, "index": _i, "done": done, "total": total})
+
             try:
                 _, downloaded = download_to_path(
                     item["source"], dest,
@@ -176,19 +181,28 @@ class DataLoader:
                     overwrite=overwrite,
                     sha256=item["sha256"],
                     timeout=timeout,
-                    progress_cb=_NodeProgress(),
+                    progress_cb=progress_cb,
                 )
                 entry["ok"] = True
                 entry["downloaded"] = downloaded
                 any_downloaded = any_downloaded or downloaded
+                _send("dataloader.file", {
+                    "node": node_id, "index": idx,
+                    "status": "downloaded" if downloaded else "cached",
+                })
             except Exception as exc:
                 entry["ok"] = False
                 entry["error"] = f"{type(exc).__name__}: {exc}"
                 print(f"[DataLoader] ERROR {item['source']} -> {dest}: {entry['error']}",
                       flush=True)
+                _send("dataloader.file", {
+                    "node": node_id, "index": idx,
+                    "status": "error", "error": entry["error"],
+                })
                 results.append(entry)
                 if stop_on_error:
                     summary = json.dumps(results, ensure_ascii=False)
+                    _send("dataloader.done", {"node": node_id})
                     raise RuntimeError(
                         f"DataLoader failed on {item['source']}: {entry['error']}\n{summary}"
                     ) from exc
@@ -198,6 +212,7 @@ class DataLoader:
         if any_downloaded:
             refresh_folder_cache()
 
+        _send("dataloader.done", {"node": node_id})
         summary = json.dumps(results, ensure_ascii=False)
         print(f"[DataLoader] Summary: {summary}", flush=True)
         return {"ui": {"text": [summary]}, "result": (summary,)}
