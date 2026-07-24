@@ -139,15 +139,21 @@ function addRow(node, data) {
 }
 
 function buildEditor(node) {
-    const wrap = document.createElement("div");
-    wrap.style.cssText =
+    // `outer` is handed to addDOMWidget and gets force-sized by ComfyUI, so we
+    // measure `content` (its natural height) for computeSize instead.
+    const outer = document.createElement("div");
+    outer.style.cssText = "width:100%;box-sizing:border-box;";
+
+    const content = document.createElement("div");
+    content.style.cssText =
         "display:flex;flex-direction:column;gap:6px;width:100%;" +
         "box-sizing:border-box;padding:2px 0;";
+    outer.appendChild(content);
 
     const rows = document.createElement("div");
     rows.style.cssText = "display:flex;flex-direction:column;gap:6px;";
     node._dlRows = rows;
-    wrap.appendChild(rows);
+    content.appendChild(rows);
 
     const addBtn = document.createElement("button");
     addBtn.textContent = "+ Add File";
@@ -160,10 +166,10 @@ function buildEditor(node) {
         syncCommands(node);
         resize(node);
     };
-    wrap.appendChild(addBtn);
+    content.appendChild(addBtn);
 
-    node._dlWrap = wrap;
-    return wrap;
+    node._dlContent = content;
+    return outer;
 }
 
 function rebuildRows(node) {
@@ -225,13 +231,16 @@ function renderResult(node, text) {
         display = text;
     }
     if (!node._dlResultEl) {
+        const outer = document.createElement("div");
+        outer.style.cssText = "width:100%;box-sizing:border-box;";
         const el = document.createElement("div");
         el.style.cssText =
             "background:#181818;color:#dcdcdc;font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;" +
-            "padding:6px 8px;border-radius:4px;white-space:pre-wrap;overflow:auto;box-sizing:border-box;";
+            "padding:6px 8px;border-radius:4px;white-space:pre-wrap;box-sizing:border-box;";
+        outer.appendChild(el);
         node._dlResultEl = el;
-        const rw = node.addDOMWidget("dl_result", "div", el, { serialize: false });
-        rw.computeSize = (width) => [width, (el.scrollHeight || 20) + 4];
+        const rw = node.addDOMWidget("dl_result", "div", outer, { serialize: false });
+        rw.computeSize = (width) => [width, (el.offsetHeight || 20) + 6];
     }
     node._dlResultEl.textContent = display;
     resize(node);
@@ -256,11 +265,12 @@ app.registerExtension({
             this._dlCommands = this.widgets?.find((w) => w.name === "commands");
             hideWidget(this._dlCommands);
 
-            const wrap = buildEditor(this);
-            const ew = this.addDOMWidget("dl_editor", "div", wrap, { serialize: false });
-            ew.computeSize = (width) => [width, (wrap.scrollHeight || 60) + 4];
+            const node = this;
+            const outer = buildEditor(node);
+            const ew = node.addDOMWidget("dl_editor", "div", outer, { serialize: false });
+            ew.computeSize = (width) => [width, (node._dlContent.offsetHeight || 60) + 6];
 
-            rebuildRows(this); // one empty row for a fresh node
+            rebuildRows(node); // one empty row for a fresh node
             return r;
         };
 

@@ -59,7 +59,17 @@ def _verify_sha256(path: str, expected: str) -> None:
         )
 
 
-def _stream_requests(url, headers, tmp, timeout):
+def _report(name, done, total, progress_cb):
+    if progress_cb:
+        progress_cb(done, total)
+    if total:
+        print(f"[DataLoader] {name}: {done * 100 // total}% "
+              f"({done >> 20}/{total >> 20} MiB)", flush=True)
+    else:
+        print(f"[DataLoader] {name}: {done >> 20} MiB", flush=True)
+
+
+def _stream_requests(url, headers, tmp, timeout, progress_cb=None):
     with requests.get(
         url, headers=headers, stream=True, timeout=timeout, allow_redirects=True
     ) as r:
@@ -70,29 +80,45 @@ def _stream_requests(url, headers, tmp, timeout):
             )
         r.raise_for_status()
         total = int(r.headers.get("Content-Length") or 0)
+        name = os.path.basename(tmp)
         done = 0
-        next_log = 0
+        next_mark = 0
+        step = max(total // 100, CHUNK) if total else 4 * CHUNK
+        if progress_cb:
+            progress_cb(0, total)
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(CHUNK):
                 if not chunk:
                     continue
                 f.write(chunk)
                 done += len(chunk)
-                if total and done >= next_log:
-                    pct = done * 100 // total
-                    print(f"[DataLoader] {os.path.basename(tmp)}: {pct}% "
-                          f"({done >> 20}/{total >> 20} MiB)", flush=True)
-                    next_log = done + max(total // 20, CHUNK)
+                if done >= next_mark:
+                    _report(name, done, total, progress_cb)
+                    next_mark = done + step
+        _report(name, done, total, progress_cb)
 
 
-def _stream_urllib(url, headers, tmp, timeout):  # pragma: no cover
+def _stream_urllib(url, headers, tmp, timeout, progress_cb=None):  # pragma: no cover
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
-        while True:
-            chunk = r.read(CHUNK)
-            if not chunk:
-                break
-            f.write(chunk)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        name = os.path.basename(tmp)
+        done = 0
+        next_mark = 0
+        step = max(total // 100, CHUNK) if total else 4 * CHUNK
+        if progress_cb:
+            progress_cb(0, total)
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if done >= next_mark:
+                    _report(name, done, total, progress_cb)
+                    next_mark = done + step
+        _report(name, done, total, progress_cb)
 
 
 def download_to_path(
@@ -102,12 +128,16 @@ def download_to_path(
     overwrite: bool = False,
     sha256: str = "",
     timeout: int = 120,
+    progress_cb=None,
 ):
     """Stream ``url`` to ``dest_path`` atomically.
 
     Returns ``(dest_path, downloaded)`` - ``downloaded`` is ``False`` when an
     existing file was reused. Writes to a ``.part`` temp file and renames on
     success so a partial download never looks like a complete model.
+
+    ``progress_cb(done_bytes, total_bytes)`` is called periodically while
+    streaming (``total_bytes`` is ``0`` when the server omits Content-Length).
     """
     url = (url or "").strip()
     if not url:
@@ -129,9 +159,9 @@ def download_to_path(
     print(f"[DataLoader] Downloading {url} -> {dest_path}", flush=True)
     try:
         if _HAS_REQUESTS:
-            _stream_requests(url, req_headers, tmp, timeout)
+            _stream_requests(url, req_headers, tmp, timeout, progress_cb)
         else:
-            _stream_urllib(url, req_headers, tmp, timeout)
+            _stream_urllib(url, req_headers, tmp, timeout, progress_cb)
         _verify_sha256(tmp, sha256)
         os.replace(tmp, dest_path)
     except Exception:

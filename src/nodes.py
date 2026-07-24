@@ -41,7 +41,32 @@ import json
 
 from .download import download_to_path, refresh_folder_cache, comfy_base_path
 
+try:  # optional - only present inside a running ComfyUI
+    import comfy.utils as _comfy_utils
+except Exception:
+    _comfy_utils = None
+
 CATEGORY = "data"
+
+
+class _NodeProgress:
+    """Drives ComfyUI's native per-node progress bar from download bytes.
+
+    A fresh instance per file: the node's bar fills 0->100% for each download.
+    No-op when Content-Length is unknown or comfy.utils is unavailable.
+    """
+
+    def __init__(self):
+        self.pbar = None
+        self.total = 0
+
+    def __call__(self, done, total):
+        if _comfy_utils is None or total <= 0:
+            return
+        if self.pbar is None or self.total != total:
+            self.pbar = _comfy_utils.ProgressBar(total)
+            self.total = total
+        self.pbar.update_absolute(min(done, total), total)
 
 
 def _is_string_list(value):
@@ -151,6 +176,7 @@ class DataLoader:
                     overwrite=overwrite,
                     sha256=item["sha256"],
                     timeout=timeout,
+                    progress_cb=_NodeProgress(),
                 )
                 entry["ok"] = True
                 entry["downloaded"] = downloaded
