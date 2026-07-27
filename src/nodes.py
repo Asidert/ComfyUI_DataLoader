@@ -34,6 +34,12 @@ You can pass a single file or a whole list:
 An object form is also accepted per item for readability::
 
     {"destination": "...", "source": "...", "headers": {...}, "sha256": "..."}
+
+Dry run
+-------
+In ``manifest`` mode, ``dry_run`` computes the same diff but downloads nothing
+and reports it as a ``dataloader.plan`` websocket event. It lets a caller show
+what is stale on a running worker without touching it.
 """
 
 import os
@@ -159,6 +165,10 @@ class DataLoader:
                 }),
                 "token": ("STRING", {"default": ""}),
                 "force": ("BOOLEAN", {"default": False}),
+                # Посчитать разницу и отчитаться событием dataloader.plan,
+                # ничего не скачивая. Нужно бэкенду, чтобы показать в админке,
+                # что на воркере устарело, не трогая сам под.
+                "dry_run": ("BOOLEAN", {"default": False}),
                 # manifest mode: emit a `dataloader.speedcheck` WS event after
                 # this many seconds so the caller can decide to wait or bail on a
                 # slow worker (0 = off).
@@ -178,12 +188,12 @@ class DataLoader:
 
     def run(self, mode="manual", commands="[]", overwrite=False,
             manifest_url="", token="", force=False, speed_probe_seconds=10,
-            stop_on_error=True, timeout=120, unique_id=None):
+            stop_on_error=True, timeout=120, dry_run=False, unique_id=None):
         node_id = str(unique_id) if unique_id is not None else ""
         if mode == "manifest":
             return self._run_manifest(
                 node_id, manifest_url, token, force, stop_on_error, timeout,
-                speed_probe_seconds)
+                speed_probe_seconds, dry_run)
         return self._run_manual(
             node_id, commands, overwrite, stop_on_error, timeout)
 
@@ -255,7 +265,7 @@ class DataLoader:
 
     # ---------------------------------------------------------------- manifest
     def _run_manifest(self, node_id, manifest_url, token, force, stop_on_error,
-                      timeout, speed_probe_seconds=0):
+                      timeout, speed_probe_seconds=0, dry_run=False):
         headers = {"Authorization": f"Bearer {token}"} if token else None
 
         data = fetch_json(manifest_url, headers=headers, timeout=timeout)
@@ -293,6 +303,40 @@ class DataLoader:
                 to_update.append(e)
             else:
                 up_to_date.append(e)
+
+        if dry_run:
+            plan = [
+                {
+                    "target": e["target"],
+                    "size": e["size"],
+                    "updated_at": e["updated_at"],
+                    "reason": "missing" if local_mtime(e["dest"]) is None else "outdated",
+                }
+                for e in to_update
+            ]
+            _send("dataloader.plan", {
+                "node": node_id,
+                "files": plan,
+                "total_bytes": sum(e["size"] for e in to_update),
+                "up_to_date": len(up_to_date),
+                "total": len(entries),
+            })
+            _send("dataloader.done", {"node": node_id})
+            summary = json.dumps(
+                {
+                    "mode": "manifest",
+                    "dry_run": True,
+                    "files": plan,
+                    "counts": {
+                        "total": len(entries),
+                        "to_update": len(plan),
+                        "up_to_date": len(up_to_date),
+                    },
+                },
+                ensure_ascii=False,
+            )
+            print(f"[DataLoader] Dry run: {len(plan)} file(s) to update", flush=True)
+            return {"ui": {"text": [summary]}, "result": (summary,)}
 
         files_total = len(to_update)
         total_bytes = sum(e["size"] for e in to_update)
