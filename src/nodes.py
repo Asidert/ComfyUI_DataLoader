@@ -161,7 +161,7 @@ class DataLoader:
                 "overwrite": ("BOOLEAN", {"default": False}),
                 # manifest mode.
                 "manifest_url": ("STRING", {
-                    "default": "https://dev.flammaverse.com/worker_models/image",
+                    "default": "https://flammaverse.com/worker_models/image",
                 }),
                 "token": ("STRING", {"default": ""}),
                 "force": ("BOOLEAN", {"default": False}),
