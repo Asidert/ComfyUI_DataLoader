@@ -40,11 +40,32 @@ Dry run
 In ``manifest`` mode, ``dry_run`` computes the same diff but downloads nothing
 and reports it as a ``dataloader.plan`` websocket event. It lets a caller show
 what is stale on a running worker without touching it.
+
+GC diagnostics
+--------------
+The package also registers ``GET /flamma/gc_stats`` on the ComfyUI server: a
+cheap snapshot of the garbage collector, the timings of recent full collections
+and the size of the execution cache's bookkeeping. ``?objects=1`` adds a census
+of live objects by type and ``?collect=1`` times one full ``gc.collect()``;
+both freeze the process and are refused unless the queue is empty.
+
+Cache hygiene
+-------------
+At the start of every prompt the package prunes ComfyUI's RAM_PRESSURE result
+cache: bookkeeping keys of nodes that never produced a result, entries untouched
+for ``FLAMMA_CACHE_TTL_SECONDS`` (default 600) except models (ModelPatcher, and
+anything whose ``.patcher`` is one: CLIP, VAE), and prompt history of the same
+age. ``FLAMMA_CACHE_PATCH=0`` leaves ComfyUI untouched.
 """
 
+import asyncio
+import gc
 import os
 import json
+import sys
+import threading
 import time
+from collections import Counter, deque
 
 from .download import (
     download_to_path,
@@ -442,6 +463,435 @@ class DataLoader:
         text = json.dumps(summary, ensure_ascii=False)
         print(f"[DataLoader] Sync {summary['counts']}", flush=True)
         return {"ui": {"text": [text]}, "result": (text,)}
+
+
+# ------------------------------------------------------------------ gc stats
+# Диагностика сборщика мусора процесса ComfyUI (19.10.2026). На видео-поде после
+# каждой задачи весь HTTP ComfyUI замирал на gc.collect() из prompt_worker, и
+# пауза росла с числом обработанных промптов: в процессе копились живые объекты.
+# Шелла на поде нет, а эта нода ставится на каждый под с main при старте, —
+# поэтому смотреть внутрь процесса удобнее всего отсюда.
+#
+# Лёгкая часть — O(1): счётчики gc, длительности полных сборок (ловим через
+# gc.callbacks с момента загрузки ноды), размеры кэша исполнения. Тяжёлая часть
+# (перепись объектов по типам, замер полного gc.collect()) держит GIL секундами,
+# поэтому только по явному параметру, только на пустой очереди и не чаще раза в
+# GC_HEAVY_COOLDOWN_SECONDS. Снаружи порт пода и так закрыт ключом гейтвея.
+
+GC_HEAVY_COOLDOWN_SECONDS = 30
+GC_TOP_DEFAULT = 40
+GC_TOP_MAX = 200
+
+_LOADED_AT = time.time()
+_gc_full_collections = deque(maxlen=50)
+# поколение -> [число сборок, суммарные секунды] с момента загрузки ноды
+_gc_totals = {0: [0, 0.0], 1: [0, 0.0], 2: [0, 0.0]}
+_gc_started_at = [None]
+_heavy_lock = threading.Lock()
+_heavy_last_at = [0.0]
+
+
+def _flamma_gc_callback(phase, info):
+    # Сборки не пересекаются (GIL), поэтому одного слота под старт хватает.
+    if phase == "start":
+        _gc_started_at[0] = time.perf_counter()
+        return
+    started = _gc_started_at[0]
+    if started is None:
+        return
+    _gc_started_at[0] = None
+    seconds = time.perf_counter() - started
+    generation = info.get("generation", 2)
+    totals = _gc_totals.setdefault(generation, [0, 0.0])
+    totals[0] += 1
+    totals[1] += seconds
+    if generation == 2:
+        _gc_full_collections.append({
+            "at": round(time.time(), 3),
+            "seconds": round(seconds, 4),
+            "collected": info.get("collected", 0),
+            "uncollectable": info.get("uncollectable", 0),
+        })
+
+
+# Повторный импорт модуля не должен навешивать второй колбэк.
+gc.callbacks[:] = [cb for cb in gc.callbacks
+                   if getattr(cb, "__name__", "") != _flamma_gc_callback.__name__]
+gc.callbacks.append(_flamma_gc_callback)
+
+
+def _queue_state():
+    """(выполняется, ждёт) по очереди ComfyUI; (None, None), если не достать."""
+    try:
+        running, queued = PromptServer.instance.prompt_queue.get_current_queue_volatile()
+        return len(running), len(queued)
+    except Exception:
+        return None, None
+
+
+def _find_prompt_executor():
+    """PromptExecutor из локальных переменных prompt_worker (main.py ComfyUI).
+
+    Исполнитель — локальная переменная `e` функции prompt_worker, которая
+    крутится в своём потоке всю жизнь процесса; снаружи ссылок на него нет.
+    Кадр потока достаём через sys._current_frames() — это O(число потоков) и
+    ничего в ComfyUI не патчит.
+    """
+    for frame in sys._current_frames().values():
+        while frame is not None:
+            if frame.f_code.co_name == "prompt_worker":
+                executor = frame.f_locals.get("e")
+                if executor is not None and hasattr(executor, "caches"):
+                    return executor
+            frame = frame.f_back
+    return None
+
+
+def _exec_cache_state():
+    """Размеры кэша результатов нод ComfyUI.
+
+    В режиме RAM_PRESSURE (дефолт ComfyUI 0.29) кэш пополняет used_generation и
+    timestamps на каждую ноду каждого промпта, а чистит их только вместе с
+    записью кэша. Ключ без записи (`keys_without_entry`) — нода, которая в
+    промпте была, но не выполнилась (её выход никуда не подключён, или промпт
+    упал/прерван раньше), и такой ключ остаётся в процессе навсегда.
+    """
+    executor = _find_prompt_executor()
+    cache = getattr(getattr(executor, "caches", None), "outputs", None)
+    if cache is None:
+        return None
+    entries = getattr(cache, "cache", None)
+    if not isinstance(entries, dict):
+        return {"type": type(cache).__name__}
+    used = getattr(cache, "used_generation", None)
+    # list() — атомарная копия под GIL: словари меняет поток prompt_worker.
+    used_keys = list(used) if isinstance(used, dict) else []
+    return {
+        "type": type(cache).__name__,
+        "generation": getattr(cache, "generation", None),
+        "entries": len(entries),
+        "used_generation": len(used_keys),
+        "timestamps": len(getattr(cache, "timestamps", None) or ()),
+        "keys_without_entry": sum(1 for key in used_keys if key not in entries),
+    }
+
+
+def _gc_light_stats():
+    full = list(_gc_full_collections)
+    recent = [item["seconds"] for item in full[-20:]]
+    stats = {
+        "pid": os.getpid(),
+        "python": sys.version.split()[0],
+        "uptime_seconds": round(time.time() - _LOADED_AT, 1),
+        "gc": {
+            "enabled": gc.isenabled(),
+            "threshold": gc.get_threshold(),
+            "count": gc.get_count(),
+            "stats": gc.get_stats(),
+            "totals": {
+                str(generation): {"collections": count, "seconds": round(seconds, 3)}
+                for generation, (count, seconds) in sorted(_gc_totals.items())
+            },
+            "full_recent_max_seconds": max(recent) if recent else None,
+            "full_recent_avg_seconds": round(sum(recent) / len(recent), 4) if recent else None,
+            "full_collections": full,
+        },
+        "exec_cache": _exec_cache_state(),
+        "cache_hygiene": dict(_cache_hygiene),
+    }
+    running, queued = _queue_state()
+    stats["queue"] = {"running": running, "pending": queued}
+    try:
+        import psutil
+        stats["rss_bytes"] = psutil.Process().memory_info().rss
+    except Exception:
+        stats["rss_bytes"] = None
+    return stats
+
+
+def _object_census(top):
+    """Перепись отслеживаемых gc объектов: всего и топ типов по числу."""
+    started = time.perf_counter()
+    objects = gc.get_objects()
+    try:
+        total = len(objects)
+        by_type = Counter(map(type, objects))
+    finally:
+        del objects
+    rows = []
+    for kind, count in by_type.most_common(top):
+        module = getattr(kind, "__module__", "") or ""
+        name = getattr(kind, "__qualname__", None) or getattr(kind, "__name__", repr(kind))
+        rows.append({"type": name if module == "builtins" else f"{module}.{name}", "count": count})
+    return {
+        "tracked": total,
+        "types": len(by_type),
+        "top": rows,
+        "census_seconds": round(time.perf_counter() - started, 3),
+    }
+
+
+def _timed_full_collect():
+    started = time.perf_counter()
+    collected = gc.collect()
+    return {"seconds": round(time.perf_counter() - started, 4), "collected": collected}
+
+
+def _heavy_refusal():
+    """Причина отказа тяжёлому запросу или None; при None занимает слот."""
+    running, queued = _queue_state()
+    if running is None:
+        return 503, "queue_unavailable"
+    if running or queued:
+        return 409, "queue_busy"
+    now = time.time()
+    if not _heavy_lock.acquire(blocking=False):
+        return 429, "heavy_in_progress"
+    wait = GC_HEAVY_COOLDOWN_SECONDS - (now - _heavy_last_at[0])
+    if wait > 0:
+        _heavy_lock.release()
+        return 429, f"cooldown_{int(wait) + 1}s"
+    return None
+
+
+def _register_gc_routes():
+    instance = getattr(PromptServer, "instance", None) if PromptServer is not None else None
+    if instance is None:
+        return
+    from aiohttp import web
+
+    @instance.routes.get("/flamma/gc_stats")
+    async def flamma_gc_stats(request):
+        query = request.rel_url.query
+        want_objects = query.get("objects") == "1"
+        want_collect = query.get("collect") == "1"
+        try:
+            top = min(GC_TOP_MAX, max(1, int(query.get("top", GC_TOP_DEFAULT))))
+        except ValueError:
+            return web.json_response({"error": "bad_top"}, status=400)
+
+        if not (want_objects or want_collect):
+            return web.json_response(_gc_light_stats())
+
+        refusal = _heavy_refusal()
+        if refusal is not None:
+            status, reason = refusal
+            return web.json_response({"error": reason}, status=status)
+        try:
+            payload = {}
+            # Сначала сборка: перепись после неё не считает уже мёртвый мусор.
+            if want_collect:
+                payload["collect"] = await asyncio.to_thread(_timed_full_collect)
+            if want_objects:
+                payload["objects"] = await asyncio.to_thread(_object_census, top)
+            payload.update(_gc_light_stats())
+            return web.json_response(payload)
+        finally:
+            _heavy_last_at[0] = time.time()
+            _heavy_lock.release()
+
+
+try:
+    _register_gc_routes()
+except Exception as exc:  # диагностика не должна ронять загрузку ноды
+    print(f"[DataLoader] gc_stats route not registered: {type(exc).__name__}: {exc}", flush=True)
+
+
+# ------------------------------------------------------------- cache hygiene
+# Чистка памяти процесса ComfyUI от старых задач (19.10.2026). Кэш результатов в
+# режиме RAM_PRESSURE (дефолт ComfyUI 0.29, в апстриме на 19.10.2026 так же):
+# 1) пишет ключ каждого узла каждого промпта в used_generation/timestamps, а
+#    чистит их только вместе с записью кэша — ключ узла, который не выполнился
+#    (выход никуда не подключён, промпт упал или прерван), остаётся навсегда;
+# 2) неактивные записи вытесняет, только когда свободной RAM меньше
+#    min(128 ГБ, вся RAM): на машине с 236 ГБ результаты всех задач лежат, пока
+#    не съедят ~100 ГБ.
+# И то и другое — живые объекты (ключ узла — ~100–230 frozenset/tuple), которые
+# gc.collect() после каждой задачи обходит под GIL: на видео-поде с 26 тысячами
+# промптов это была пауза ~4 с. Поэтому в начале каждого промпта (в clean_unused
+# кэша, поток prompt_worker — гонок с исполнением нет):
+# - удаляем ключи без записи, кроме ключей текущего промпта;
+# - выгружаем записи, к которым не обращались дольше FLAMMA_CACHE_TTL_SECONDS,
+#   кроме моделей: ModelPatcher (чекпойнт, UNet, лора) и всё, у чего .patcher —
+#   ModelPatcher (CLIP, VAE). Модели и лоры остаются загруженными; вытеснение
+#   ComfyUI по нехватке RAM работает как раньше;
+# - удаляем историю промптов старше того же срока.
+# FLAMMA_CACHE_TTL_SECONDS=0 — только ключи без записи; FLAMMA_CACHE_PATCH=0 —
+# не трогать ComfyUI вовсе. Счётчики — в /flamma/gc_stats → cache_hygiene.
+
+CACHE_TTL_DEFAULT_SECONDS = 600
+
+_cache_hygiene = {
+    "installed": False,
+    "ttl_seconds": None,
+    "runs": 0,
+    "orphan_keys_dropped": 0,
+    "entries_dropped": 0,
+    "history_dropped": 0,
+    "last_run_at": None,
+    "last_run_seconds": None,
+    "error": None,
+}
+# Классы «модели»; заполняется при установке патча (в тестах — подменяется).
+_MODEL_TYPES = ()
+
+
+def _cache_ttl_seconds():
+    raw = os.environ.get("FLAMMA_CACHE_TTL_SECONDS", "").strip()
+    if not raw:
+        return CACHE_TTL_DEFAULT_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        print(f"[DataLoader] FLAMMA_CACHE_TTL_SECONDS={raw!r} is not a number, "
+              f"using {CACHE_TTL_DEFAULT_SECONDS}", flush=True)
+        return CACHE_TTL_DEFAULT_SECONDS
+
+
+def _is_model_object(value):
+    if isinstance(value, _MODEL_TYPES):
+        return True
+    try:
+        return isinstance(getattr(value, "patcher", None), _MODEL_TYPES)
+    except Exception:
+        return False
+
+
+def _holds_model(outputs):
+    """Есть ли среди выходов узла модель (выходы — вложенные списки/кортежи)."""
+    stack = [outputs]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, (list, tuple)):
+            stack.extend(value)
+        elif _is_model_object(value):
+            return True
+    return False
+
+
+def prune_exec_cache(cache, now, ttl_seconds):
+    """Почистить кэш результатов; вернуть (ключей без записи, записей) удалено."""
+    live = set(cache.cache_key_set.get_used_keys())
+    entries = cache.cache
+    side = [d for d in (getattr(cache, "used_generation", None),
+                        getattr(cache, "timestamps", None),
+                        getattr(cache, "children", None)) if isinstance(d, dict)]
+    timestamps = getattr(cache, "timestamps", None) or {}
+
+    orphans = set()
+    for bookkeeping in side:
+        orphans.update(key for key in bookkeeping if key not in entries and key not in live)
+    for bookkeeping in side:
+        for key in orphans:
+            bookkeeping.pop(key, None)
+
+    dropped = 0
+    if ttl_seconds > 0:
+        for key, entry in list(entries.items()):
+            if key in live:
+                continue
+            touched = timestamps.get(key)
+            if touched is None or now - touched <= ttl_seconds:
+                continue
+            if _holds_model(getattr(entry, "outputs", None)):
+                continue
+            del entries[key]
+            for bookkeeping in side:
+                bookkeeping.pop(key, None)
+            dropped += 1
+    return len(orphans), dropped
+
+
+def _history_created_at(item):
+    """Время постановки промпта (сек) по записи истории ComfyUI; None — не понять."""
+    try:
+        created = item["prompt"][3].get("create_time")
+        if created:
+            return float(created) / 1000.0
+    except Exception:
+        pass
+    try:
+        stamps = [data.get("timestamp") for _, data in item["status"]["messages"]]
+        stamps = [stamp for stamp in stamps if stamp]
+        return max(stamps) / 1000.0 if stamps else None
+    except Exception:
+        return None
+
+
+def prune_history(queue, now, ttl_seconds):
+    """Удалить из истории промпты старше ttl_seconds; вернуть, сколько удалено."""
+    if ttl_seconds <= 0:
+        return 0
+    with queue.mutex:
+        stale = [prompt_id for prompt_id, item in queue.history.items()
+                 if (created := _history_created_at(item)) is not None
+                 and now - created > ttl_seconds]
+        for prompt_id in stale:
+            queue.history.pop(prompt_id, None)
+    return len(stale)
+
+
+def _run_cache_hygiene(cache):
+    started = time.perf_counter()
+    now = time.time()
+    ttl = _cache_hygiene["ttl_seconds"] or 0
+    orphans, entries = prune_exec_cache(cache, now, ttl)
+    history = 0
+    queue = getattr(getattr(PromptServer, "instance", None), "prompt_queue", None) if PromptServer else None
+    if queue is not None:
+        history = prune_history(queue, now, ttl)
+    _cache_hygiene["runs"] += 1
+    _cache_hygiene["orphan_keys_dropped"] += orphans
+    _cache_hygiene["entries_dropped"] += entries
+    _cache_hygiene["history_dropped"] += history
+    _cache_hygiene["last_run_at"] = round(now, 3)
+    _cache_hygiene["last_run_seconds"] = round(time.perf_counter() - started, 4)
+
+
+def _install_cache_hygiene():
+    global _MODEL_TYPES
+    if os.environ.get("FLAMMA_CACHE_PATCH", "1").strip() == "0":
+        _cache_hygiene["error"] = "disabled_by_env"
+        return
+    try:
+        from comfy_execution import caching
+        from comfy.model_patcher import ModelPatcher
+    except Exception as exc:
+        _cache_hygiene["error"] = f"comfy_unavailable: {type(exc).__name__}"
+        return
+    cache_cls = getattr(caching, "RAMPressureCache", None)
+    original = getattr(cache_cls, "clean_unused", None)
+    if original is None:
+        # Другая версия ComfyUI — патч рассчитан на устройство кэша 0.29.
+        _cache_hygiene["error"] = "ram_pressure_cache_not_found"
+        print("[DataLoader] cache hygiene skipped: RAMPressureCache.clean_unused not found", flush=True)
+        return
+    if getattr(original, "_flamma_hygiene", False):
+        return
+    _MODEL_TYPES = (ModelPatcher,)
+
+    def clean_unused(self):
+        original(self)
+        try:
+            _run_cache_hygiene(self)
+        except Exception as exc:
+            # Чистка — не повод ронять промпт: пишем и работаем дальше как ComfyUI.
+            if _cache_hygiene["error"] is None:
+                print(f"[DataLoader] cache hygiene failed: {type(exc).__name__}: {exc}", flush=True)
+            _cache_hygiene["error"] = f"{type(exc).__name__}: {exc}"
+
+    clean_unused._flamma_hygiene = True
+    cache_cls.clean_unused = clean_unused
+    _cache_hygiene["installed"] = True
+    _cache_hygiene["ttl_seconds"] = _cache_ttl_seconds()
+    print(f"[DataLoader] cache hygiene installed, ttl={_cache_hygiene['ttl_seconds']}s", flush=True)
+
+
+try:
+    _install_cache_hygiene()
+except Exception as exc:  # патч не должен ронять загрузку ноды
+    _cache_hygiene["error"] = f"{type(exc).__name__}: {exc}"
+    print(f"[DataLoader] cache hygiene not installed: {type(exc).__name__}: {exc}", flush=True)
 
 
 NODE_CLASS_MAPPINGS = {
